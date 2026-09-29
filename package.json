@@ -1,0 +1,13 @@
+{
+  "name": "terraria-online-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cliente passivo Node.js para Terraria 1.4.5.8 (protocolo 326)",
+  "type": "module",
+  "engines": { "node": ">=22.0.0" },
+  "scripts": {
+    "prestart": "npm install --ignore-scripts --no-audit --no-fund --package-lock=false",
+    "start": "node index.js",
+    "test": "node --test"
+  }
+}
