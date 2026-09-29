@@ -33,6 +33,10 @@ export function readConfig(env) {
     journey: mode === 'journey',
     uuid: randomUUID(), // Mantido durante todas as reconexões deste processo.
     reconnectDelayMs: integer(env.RECONNECT_DELAY_MS, 5000, 1000, 60000, 'RECONNECT_DELAY_MS'),
+    maxReconnectAttempts: integer(env.MAX_RECONNECT_ATTEMPTS, 5, 0, 20, 'MAX_RECONNECT_ATTEMPTS'),
+    maxProtocolReconnectAttempts: integer(env.MAX_PROTOCOL_RECONNECT_ATTEMPTS, 1, 0, 3, 'MAX_PROTOCOL_RECONNECT_ATTEMPTS'),
+    protocolReconnectDelayMs: 60000,
+    stableConnectionMs: 60000,
     connectTimeoutMs: 15000,
     joinTimeoutMs: 120000,
     idleTimeoutMs: 60000,
