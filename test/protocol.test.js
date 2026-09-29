@@ -4,11 +4,12 @@ import { readConfig } from '../src/config.js';
 import {
   VERSION, INVENTORY_SLOTS, Reader, PacketDecoder, packet, text,
   playerInfo, emptyInventoryItem, requestTiles, spawn, controls, worldInfo,
+  isInventorySlot, INVENTORY_SLOT_RANGES, readControls, readTeleport, teleportAck,
 } from '../src/protocol.js';
 
 test('versão e layouts alterados em Terraria 1.4.5.8', () => {
   assert.equal(packet(1, text(VERSION)).toString('hex'), '0f00010b5465727261726961333236');
-  assert.equal(INVENTORY_SLOTS, 990);
+  assert.equal(INVENTORY_SLOTS, 350);
   const r = new Reader(playerInfo(7, 'Bot', true));
   assert.equal(r.u8(), 7);
   assert.equal(r.u8(), 0);
@@ -75,4 +76,79 @@ test('validação da configuração e mundo', () => {
   assert.throws(() => readConfig({ ...env, CHARACTER_NAME: '\n' }));
   assert.throws(() => readConfig({ ...env, CHARACTER_MODE: 'invalid' }));
   assert.throws(() => worldInfo(Buffer.alloc(14)));
+  assert.equal(readConfig(env).maxReconnectAttempts, 5);
+  assert.equal(readConfig(env).maxProtocolReconnectAttempts, 1);
+  assert.equal(readConfig(env).protocolReconnectDelayMs, 60000);
+  for (const [key, invalid] of [['MAX_RECONNECT_ATTEMPTS', '21'], ['MAX_PROTOCOL_RECONNECT_ATTEMPTS', '4']]) {
+    assert.throws(() => readConfig({ ...env, [key]: invalid }));
+    assert.throws(() => readConfig({ ...env, [key]: '-1' }));
+    assert.equal(readConfig({ ...env, [key]: '0' })[key === 'MAX_RECONNECT_ATTEMPTS' ? 'maxReconnectAttempts' : 'maxProtocolReconnectAttempts'], 0);
+  }
+});
+
+test('regressão: IDs reservados não são posições existentes nos bancos', () => {
+  // Oráculo independente: limites inclusivos dos arrays do servidor 1.4.5.8.
+  const valid = [[0, 138], [299, 338], [499, 539], [700, 739], [900, 989]];
+  let accepted = 0;
+  for (let slot = -1; slot <= 1000; slot++) {
+    const expected = valid.some(([first, last]) => slot >= first && slot <= last);
+    assert.equal(isInventorySlot(slot), expected, `slot=${slot}`);
+    if (expected) {
+      const data = emptyInventoryItem(254, slot);
+      assert.equal(data.length, 9);
+      assert.equal(data.readInt16LE(1), slot);
+      assert.deepEqual([...data.subarray(3)], [0, 0, 0, 0, 0, 0]);
+      accepted++;
+    } else {
+      assert.throws(() => emptyInventoryItem(0, slot), /inventário inválido/);
+    }
+  }
+  assert.equal(accepted, 350);
+  assert.equal(INVENTORY_SLOT_RANGES.reduce((total, [, count]) => total + count, 0), accepted);
+  assert.throws(() => emptyInventoryItem(0, 139), /139/);
+  for (const slot of [NaN, Infinity, 1.5, '0', null]) assert.throws(() => emptyInventoryItem(0, slot));
+});
+
+test('serializadores rejeitam jogador, estatística e coordenada inválidos', () => {
+  for (const slot of [-1, 255, 256, NaN, 1.5, null]) {
+    assert.throws(() => playerInfo(slot, 'Bot'));
+    assert.throws(() => emptyInventoryItem(slot, 0));
+    assert.throws(() => spawn(slot));
+    assert.throws(() => controls(slot, 0, 0));
+    assert.throws(() => teleportAck(slot));
+  }
+  for (const id of [-1, 256, 1.5, NaN]) assert.throws(() => packet(id));
+  for (const x of [NaN, Infinity, 1e100]) assert.throws(() => controls(0, x, 0));
+  assert.throws(() => playerInfo(0, ''));
+  assert.throws(() => spawn(0, 4));
+});
+
+test('PlayerControls consome todos os campos opcionais de 1.4.5.8', () => {
+  const base = controls(7, 20, 30);
+  assert.deepEqual([...base.subarray(0, 6)], [7, 64, 16, 0, 0, 0]);
+  assert.deepEqual(readControls(base), { slot: 7, x: 20, y: 30 });
+  base[2] |= 4 | 128;
+  base[3] |= 64;
+  base[4] |= 32;
+  const full = Buffer.concat([base, Buffer.alloc(8 + 2 + 16 + 8)]);
+  assert.deepEqual(readControls(full), { slot: 7, x: 20, y: 30 });
+  for (let length = 0; length < full.length; length++) {
+    assert.throws(() => readControls(full.subarray(0, length)));
+  }
+  assert.throws(() => readControls(Buffer.concat([full, Buffer.from([0])])));
+});
+
+test('ACK de teleporte é tipo 3 com payload completo de 12 bytes', () => {
+  assert.equal(teleportAck(7).toString('hex'), '030700000000000000000000');
+  const teleport = Buffer.alloc(16);
+  teleport[0] = 8; // Tipo 0, informação extra int32 presente.
+  teleport.writeInt16LE(7, 1);
+  teleport.writeFloatLE(20, 3);
+  teleport.writeFloatLE(30, 7);
+  teleport[11] = 1;
+  teleport.writeInt32LE(42, 12);
+  assert.deepEqual(readTeleport(teleport), { entity: 7, type: 0, useCurrentPosition: false, x: 20, y: 30 });
+  for (let length = 0; length < teleport.length; length++) {
+    assert.throws(() => readTeleport(teleport.subarray(0, length)));
+  }
 });
