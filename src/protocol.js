@@ -2,7 +2,33 @@
 // https://terraria.org/api/download/pc-dedicated-server/terraria-server-1458.zip
 // Não usar "Terraria1.4.5.8" nem o protocolo 279 (1.4.4.9).
 export const VERSION = 'Terraria326';
-export const INVENTORY_SLOTS = 990; // 4 bancos de 200 slots e 3 loadouts.
+// PlayerItemSlotID reserva 200 IDs por banco, mas Chest.CreateBank cria
+// arrays de 40 itens. Count=990 é o limite de IDs, NÃO uma faixa contínua.
+// Faixas [início, quantidade] verificadas em PlayerItemSlotID, Player e Chest.
+export const INVENTORY_SLOT_RANGES = Object.freeze([
+  [0, 59], [59, 20], [79, 10], [89, 5], [94, 5],
+  [99, 40], [299, 40], [499, 1], [500, 40], [700, 40],
+  [900, 20], [920, 10], [930, 20], [950, 10], [960, 20], [980, 10],
+].map((range) => Object.freeze(range)));
+export const INVENTORY_SLOTS = 350; // Quantidade real, não usar como limite de IDs.
+
+export function isInventorySlot(slot) {
+  return Number.isInteger(slot) && INVENTORY_SLOT_RANGES.some(
+    ([start, count]) => slot >= start && slot < start + count,
+  );
+}
+
+function playerSlot(slot) {
+  if (!Number.isInteger(slot) || slot < 0 || slot >= 255) {
+    throw new Error('Slot de jogador inválido (esperado 0..254).');
+  }
+}
+
+function position(x, y) {
+  if (![x, y].every((n) => Number.isFinite(n) && Number.isFinite(Math.fround(n)))) {
+    throw new Error('Coordenada inválida.');
+  }
+}
 
 export function text(value) {
   const data = Buffer.from(value, 'utf8');
@@ -17,6 +43,7 @@ export function text(value) {
 }
 
 export function packet(id, payload = Buffer.alloc(0)) {
+  if (!Number.isInteger(id) || id < 0 || id > 255) throw new Error('ID de pacote inválido.');
   const size = payload.length + 3;
   if (size > 65535) throw new Error('Pacote excede 65535 bytes.');
   const result = Buffer.allocUnsafe(size);
@@ -97,6 +124,10 @@ export class PacketDecoder {
 }
 
 export function playerInfo(slot, name, journey = false) {
+  playerSlot(slot);
+  if (typeof name !== 'string' || !name.trim() || name.length > 20 || /[\x00-\x1f\x7f]/u.test(name)) {
+    throw new Error('Nome de jogador inválido.');
+  }
   const header = Buffer.alloc(8);
   header[0] = slot;
   header[1] = 0; // Aparência.
@@ -113,6 +144,10 @@ export function playerInfo(slot, name, journey = false) {
 }
 
 export function stat(slot, current, maximum) {
+  playerSlot(slot);
+  if (![current, maximum].every((n) => Number.isInteger(n) && n >= 0 && n <= 32767) || current > maximum) {
+    throw new Error('Estatística de jogador inválida.');
+  }
   const data = Buffer.alloc(5);
   data[0] = slot;
   data.writeInt16LE(current, 1);
@@ -120,7 +155,10 @@ export function stat(slot, current, maximum) {
   return data;
 }
 
+// Utilitário preservado, mas NÃO usado pelo cliente passivo ao entrar.
 export function emptyInventoryItem(slot, itemSlot) {
+  playerSlot(slot);
+  if (!isInventorySlot(itemSlot)) throw new Error(`Slot de inventário inválido: ${itemSlot}.`);
   const data = Buffer.alloc(9);
   data[0] = slot;
   data.writeInt16LE(itemSlot, 1);
@@ -149,6 +187,8 @@ export function worldInfo(data) {
 }
 
 export function spawn(slot, context = 1) {
+  playerSlot(slot);
+  if (![0, 1, 2].includes(context)) throw new Error('Contexto de spawn inválido.');
   const data = Buffer.alloc(15);
   data[0] = slot;
   data.writeInt16LE(-1, 1); // Sem cama: usar spawn do mundo.
@@ -159,6 +199,8 @@ export function spawn(slot, context = 1) {
 }
 
 export function controls(slot, x, y) {
+  playerSlot(slot);
+  position(x, y);
   const data = Buffer.alloc(14);
   data[0] = slot;
   data[1] = 0x40; // Olhando para a direita, sem pressionar teclas.
@@ -166,4 +208,45 @@ export function controls(slot, x, y) {
   data.writeFloatLE(x, 6);
   data.writeFloatLE(y, 10);
   return data;
+}
+
+// MessageBuffer case 65: responder SOMENTE ao teleporte tipo 0 do próprio
+// jogador. Tipo 3 é ACK, não solicita teleporte nem altera o mundo.
+export function teleportAck(slot) {
+  playerSlot(slot);
+  const data = Buffer.alloc(12);
+  data[0] = 3;
+  data.writeInt16LE(slot, 1);
+  return data;
+}
+
+export function readControls(data) {
+  const r = new Reader(data);
+  const slot = r.u8();
+  playerSlot(slot);
+  r.u8();
+  const flags2 = r.u8();
+  const flags3 = r.u8();
+  const flags4 = r.u8();
+  r.u8(); // Item selecionado; nunca o retransmitir.
+  const x = r.f32();
+  const y = r.f32();
+  if (flags2 & 4) { r.f32(); r.f32(); }
+  if (flags2 & 128) r.take(2); // Mount uint16.
+  if (flags3 & 64) { r.f32(); r.f32(); r.f32(); r.f32(); }
+  if (flags4 & 32) { r.f32(); r.f32(); }
+  if (r.offset !== data.length) throw new Error('PlayerControls com layout incompatível.');
+  return { slot, x, y };
+}
+
+export function readTeleport(data) {
+  const r = new Reader(data);
+  const flags = r.u8();
+  const entity = r.i16();
+  const x = r.f32();
+  const y = r.f32();
+  r.u8(); // Estilo.
+  if (flags & 8) r.i32(); // Informação extra opcional.
+  if (r.offset !== data.length) throw new Error('TeleportEntity com layout incompatível.');
+  return { entity, type: flags & 3, useCurrentPosition: Boolean(flags & 4), x, y };
 }
