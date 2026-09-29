@@ -15,6 +15,7 @@ try {
 
 try {
   const bot = new TerrariaBot(readConfig(process.env));
+  bot.once('halted', () => { process.exitCode = 1; });
   process.once('SIGINT', () => bot.stop());
   process.once('SIGTERM', () => bot.stop());
   bot.start();
