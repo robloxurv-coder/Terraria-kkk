@@ -1,16 +1,19 @@
 import net from 'node:net';
 import { EventEmitter } from 'node:events';
 import {
-  VERSION, INVENTORY_SLOTS, PacketDecoder, Reader, packet, text,
-  playerInfo, stat, emptyInventoryItem, requestTiles, worldInfo, spawn, controls,
+  VERSION, PacketDecoder, Reader, packet, text,
+  playerInfo, stat, requestTiles, worldInfo, spawn, controls,
+  readControls, readTeleport, teleportAck,
 } from './protocol.js';
+
+// Sem inventário, tiles, itens, combate ou comandos de mundo.
+const OUTBOUND = new Set([1, 4, 6, 8, 12, 13, 16, 38, 42, 50, 65, 68, 147]);
 
 function safeMessage(value) {
   return String(value).replace(/[\x00-\x1f\x7f-\x9f]/gu, '').slice(0, 500);
 }
 
-// Cliente passivo: entra e mantém presença; não implementa IA, combate,
-// renderização, física completa, comandos ou autenticação de plugins TShock.
+// Cliente passivo: não implementa IA, combate, física completa ou login TShock.
 export class TerrariaBot extends EventEmitter {
   constructor(config, logger = console) {
     super();
@@ -24,6 +27,9 @@ export class TerrariaBot extends EventEmitter {
   start() {
     if (!this.stopped) return;
     this.stopped = false;
+    this.reconnectAttempts = 0;
+    this.protocolReconnectAttempts = 0;
+    this.retryDelay = this.config.reconnectDelayMs;
     this.connect();
   }
 
@@ -34,13 +40,22 @@ export class TerrariaBot extends EventEmitter {
     this.slot = null;
     this.world = null;
     this.tilesRequested = false;
+    this.passwordSent = false;
+    this.onlineSince = null;
+    this.failureKind = 'transport';
+    this.disconnectReason = null;
+    this.lastSentId = null;
+    this.lastReceivedId = null;
     this.lastReceived = Date.now();
     const socket = new net.Socket();
     this.socket = socket;
     socket.setNoDelay(true);
     socket.setKeepAlive(true, 10000);
     const decoder = new PacketDecoder((id, data) => {
-      if (!socket.destroyed) this.handlePacket(id, data);
+      if (!socket.destroyed) {
+        this.lastReceivedId = id;
+        this.handlePacket(id, data);
+      }
     });
     socket.on('connect', () => {
       clearTimeout(this.connectTimer);
@@ -54,19 +69,41 @@ export class TerrariaBot extends EventEmitter {
       try {
         decoder.push(chunk);
       } catch (error) {
-        this.fail(`Erro de protocolo: ${error.message}`);
+        this.fail(`Erro de protocolo: ${error.message}`, 'protocol');
       }
     });
-    socket.on('error', (error) => this.logger.error(`Erro de conexão: ${safeMessage(error.code ?? error.message)}`));
+    socket.on('error', (error) => this.fail(`Erro de conexão: ${error.code ?? error.message}`));
     socket.on('close', () => {
       this.clearSessionTimers();
+      if (!this.stopped && !this.disconnectReason) {
+        this.disconnectReason = 'Conexão TCP encerrada sem motivo informado; consulte o log do servidor.';
+        this.logger.error(`${this.disconnectReason} ${this.sessionContext()}`);
+      }
       this.socket = null;
       this.state = 'offline';
       this.logger.log('Desconectado.');
       this.emit('disconnected');
       if (this.stopped) return;
-      const delay = this.retryDelay;
-      this.retryDelay = Math.min(this.retryDelay * 2, 60000);
+      if (this.failureKind === 'rejected') {
+        this.halt('Servidor recusou a sessão; corrija a causa antes de iniciar novamente.');
+        return;
+      }
+      if (this.reconnectAttempts >= this.config.maxReconnectAttempts ||
+          (this.failureKind === 'protocol' && this.protocolReconnectAttempts >= this.config.maxProtocolReconnectAttempts)) {
+        this.halt('Limite de reconexões atingido; revise os logs antes de iniciar novamente.');
+        return;
+      }
+      this.reconnectAttempts++;
+      if (this.failureKind === 'protocol') this.protocolReconnectAttempts++;
+      // Entrada breve não reinicia o backoff. Limites totais só reiniciam
+      // por start() explícito, nunca automaticamente após um spawn.
+      if (this.onlineSince !== null && Date.now() - this.onlineSince >= this.config.stableConnectionMs) {
+        this.retryDelay = this.config.reconnectDelayMs;
+      }
+      const delay = this.failureKind === 'protocol'
+        ? Math.max(this.retryDelay, this.config.protocolReconnectDelayMs) : this.retryDelay;
+      this.retryDelay = Math.min(Math.max(delay, this.retryDelay) * 2, 60000);
+      this.logger.log(`Reconexão ${this.reconnectAttempts}/${this.config.maxReconnectAttempts} em ${delay} ms.`);
       this.reconnectTimer = setTimeout(() => {
         this.reconnectTimer = null;
         this.logger.log('Tentando reconectar...');
@@ -78,23 +115,25 @@ export class TerrariaBot extends EventEmitter {
   }
 
   send(id, payload) {
+    if (!OUTBOUND.has(id)) throw new Error(`Pacote ${id} não permitido no modo passivo.`);
     if (!this.socket || this.socket.destroyed || !this.socket.writable) return;
-    // Evitar filas ilimitadas caso o outro lado deixe de ler.
     if (this.socket.writableLength > 1024 * 1024) {
       this.fail('Servidor não está consumindo os dados.');
       return;
     }
     this.socket.write(packet(id, payload));
+    this.lastSentId = id;
   }
 
   handlePacket(id, data) {
     const r = new Reader(data);
     switch (id) {
       case 2:
-        this.fail(`Servidor encerrou a conexão: ${r.networkText()}`);
+        this.fail(`Servidor encerrou a conexão: ${r.networkText()}`, 'rejected');
         break;
       case 37:
-        if (this.state !== 'handshake') throw new Error('Pedido de senha fora de sequência.');
+        if (this.state !== 'handshake' || this.passwordSent) throw new Error('Pedido de senha fora de sequência.');
+        this.passwordSent = true;
         this.send(38, text(this.config.password));
         break;
       case 3:
@@ -124,33 +163,28 @@ export class TerrariaBot extends EventEmitter {
         if (this.state !== 'spawning') break;
         this.state = 'online';
         clearTimeout(this.joinTimer);
-        this.retryDelay = this.config.reconnectDelayMs;
+        this.onlineSince = Date.now();
         this.sendControls();
         this.logger.log('Conectado ao servidor.');
         this.emit('online');
         break;
       case 13: {
-        // Respeitar correções de posição enviadas pelo servidor/plugins.
-        if (r.u8() !== this.slot) break;
-        r.take(5);
-        this.x = r.f32();
-        this.y = r.f32();
+        // Respeitar posição do servidor sem retransmitir ações ou itens.
+        if (data[0] !== this.slot) break;
+        const update = readControls(data);
+        this.setPosition(update.x, update.y);
         break;
       }
       case 65: {
-        const flags = r.u8();
-        const entity = r.i16();
-        const x = r.f32();
-        const y = r.f32();
-        if (entity === this.slot && (flags & 3) !== 1 && !(flags & 4)) {
-          this.x = x;
-          this.y = y;
-          if (this.state === 'online') this.sendControls();
-        }
+        const teleport = readTeleport(data);
+        if (teleport.entity !== this.slot || teleport.type !== 0) break;
+        if (!['spawning', 'online'].includes(this.state)) throw new Error('Teleporte antes do spawn.');
+        if (!teleport.useCurrentPosition) this.setPosition(teleport.x, teleport.y);
+        this.send(65, teleportAck(this.slot));
         break;
       }
-      // Seções de mapa, entidades e chat são consumidos pelo enquadrador TCP.
-      // Não reenviar pacotes desconhecidos nem tratar tráfego como confirmação.
+      // Seções de mapa, inventários, entidades e chat são consumidos pelo
+      // enquadrador TCP. Não ecoar pacotes ou tratá-los como confirmação.
       default:
         break;
     }
@@ -162,22 +196,23 @@ export class TerrariaBot extends EventEmitter {
     this.send(68, text(uuid));
     this.send(16, stat(this.slot, 100, 100));
     this.send(42, stat(this.slot, 20, 20));
-    this.send(50, Buffer.from([this.slot, 0, 0])); // Buffs terminados por uint16 zero.
+    this.send(50, Buffer.from([this.slot, 0, 0])); // Terminador uint16 zero.
     this.send(147, Buffer.from([this.slot, 0, 0, 0]));
-    this.socket.cork();
-    try {
-      for (let slot = 0; slot < INVENTORY_SLOTS; slot++) {
-        this.send(5, emptyInventoryItem(this.slot, slot));
-      }
-      // Não fabricar itens: o personagem passivo começa com inventário vazio.
-    } finally {
-      this.socket.uncork();
-    }
+    // O servidor inicializa os arrays do personagem. O handshake não exige
+    // Message 5: não limpar bancos/equipamentos nem sobrescrever itens SSC.
   }
 
   resetPosition() {
-    this.x = this.world.spawnX * 16 + 8 - 10;
-    this.y = this.world.spawnY * 16 - 42;
+    this.setPosition(this.world.spawnX * 16 + 8 - 10, this.world.spawnY * 16 - 42);
+  }
+
+  setPosition(x, y) {
+    if (!this.world || !Number.isFinite(x) || !Number.isFinite(y) ||
+        x < 0 || y < 0 || x + 20 > this.world.width * 16 || y + 42 > this.world.height * 16) {
+      throw new Error('Posição de jogador fora dos limites do mundo.');
+    }
+    this.x = x;
+    this.y = y;
   }
 
   sendControls() {
@@ -185,18 +220,37 @@ export class TerrariaBot extends EventEmitter {
   }
 
   tick() {
-    // Keepalive TCP sozinho não mantém uma sessão Terraria ativa.
-    // Verificar LEITURAS: escritas periódicas não devem mascarar servidor mudo.
+    // Escritas periódicas não devem mascarar servidor sem responder.
     if (Date.now() - this.lastReceived > this.config.idleTimeoutMs) {
       this.fail('Servidor sem responder.');
       return;
     }
-    if (this.state === 'online') this.sendControls();
+    if (this.state === 'online') {
+      try {
+        this.sendControls();
+      } catch (error) {
+        this.fail(`Erro de protocolo: ${error.message}`, 'protocol');
+      }
+    }
   }
 
-  fail(message) {
-    if (this.socket && !this.socket.destroyed) {
-      this.logger.error(safeMessage(message));
+  sessionContext() {
+    return `[estado=${this.state}, recebido=${this.lastReceivedId ?? '-'}, enviado=${this.lastSentId ?? '-'}]`;
+  }
+
+  halt(reason) {
+    this.stopped = true;
+    this.logger.error(reason);
+    this.emit('halted', reason);
+  }
+
+  fail(message, kind = 'transport') {
+    // 'error' pode chegar depois de Socket.destroyed=true; ainda registrar
+    // a causa antes de 'close', sem duplicar mensagens para a mesma sessão.
+    if (this.socket && !this.disconnectReason) {
+      this.failureKind = kind;
+      this.disconnectReason = safeMessage(message);
+      this.logger.error(`${this.disconnectReason} ${this.sessionContext()}`);
       this.socket.destroy();
     }
   }
